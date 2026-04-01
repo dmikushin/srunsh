@@ -253,7 +253,6 @@ int main(int argc, char* argv[]) {
     cmd.emplace_back("--unbuffered");   // critical: srun buffers stdout by default
     if (!job_id.empty()) {
         cmd.push_back("--jobid=" + job_id);
-        cmd.emplace_back("--overlap");
     }
     for (auto& o : srun_opts) cmd.push_back(o);
     cmd.push_back(server_bin);

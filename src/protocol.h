@@ -19,6 +19,7 @@ enum : uint8_t {
     MSG_SHELL_DATA     = 0x11,
     MSG_SHELL_RESIZE   = 0x12,
     MSG_SHELL_EXIT     = 0x13,
+    MSG_SHELL_CLOSE    = 0x14,  // Client → Server: kill session on this channel
 
     MSG_FWD_OPEN       = 0x20,
     MSG_FWD_ACCEPT     = 0x21,

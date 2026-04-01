@@ -1,7 +1,7 @@
 // srunshd — server half of srunsh.
 //
-// Launched by srunsh via srun.  Communicates with the client through
-// stdin (read) / stdout (write) — the pipe that srun sets up.
+// Launched once per job via srun.  Supports multiple shell sessions
+// multiplexed over the single stdin/stdout pipe from srun.
 
 #include "protocol.h"
 #include "crypto.h"
@@ -42,7 +42,6 @@ static int connect_to(const std::string& host, uint16_t port) {
     char ps[16];
     snprintf(ps, sizeof(ps), "%u", port);
     if (getaddrinfo(host.c_str(), ps, &hints, &res) != 0) return -1;
-
     int fd = -1;
     for (auto* rp = res; rp; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
@@ -56,13 +55,11 @@ static int connect_to(const std::string& host, uint16_t port) {
 
 // ---- authentication ----
 static bool do_auth(int wr, int rd, RecvBuffer& rbuf) {
-    // Send challenge
     uint8_t challenge[32];
     if (!random_bytes(challenge, 32)) return false;
     if (!send_msg(wr, make_msg(MSG_AUTH_CHALLENGE, 0, challenge, 32)))
         return false;
 
-    // Receive response
     Message msg;
     while (true) {
         ssize_t n = rbuf.feed(rd);
@@ -84,9 +81,55 @@ static bool do_auth(int wr, int rd, RecvBuffer& rbuf) {
         send_msg(wr, make_msg(MSG_AUTH_FAIL, 0));
         return false;
     }
-
     send_msg(wr, make_msg(MSG_AUTH_OK, 0));
     return true;
+}
+
+// ---- shell session ----
+struct ShellSession {
+    int   master_fd;
+    pid_t child;
+};
+
+static bool create_shell(uint32_t channel, uint16_t rows, uint16_t cols,
+                         const std::string& command,
+                         std::map<uint32_t, ShellSession>& shells,
+                         std::map<int, uint32_t>& mfd_chan) {
+    struct winsize ws{};
+    ws.ws_row = rows;
+    ws.ws_col = cols;
+
+    int   mfd   = -1;
+    pid_t child = forkpty(&mfd, nullptr, nullptr, &ws);
+    if (child < 0) return false;
+
+    if (child == 0) {
+        setenv("TERM", "xterm-256color", 1);
+        if (command.empty()) {
+            const char* sh = getenv("SHELL");
+            if (!sh) sh = "/bin/bash";
+            execlp(sh, sh, "-l", nullptr);
+        } else {
+            execlp("/bin/sh", "sh", "-c", command.c_str(), nullptr);
+        }
+        _exit(127);
+    }
+
+    set_nonblock(mfd);
+    shells[channel]  = {mfd, child};
+    mfd_chan[mfd]    = channel;
+    return true;
+}
+
+static void kill_shell(uint32_t ch,
+                       std::map<uint32_t, ShellSession>& shells,
+                       std::map<int, uint32_t>& mfd_chan) {
+    auto it = shells.find(ch);
+    if (it == shells.end()) return;
+    close(it->second.master_fd);
+    kill(it->second.child, SIGHUP);
+    mfd_chan.erase(it->second.master_fd);
+    shells.erase(it);
 }
 
 // ---- entry point ----
@@ -99,92 +142,130 @@ int main() {
         sigaction(SIGINT,  &sa, nullptr);
     }
 
-    int rd_fd = STDIN_FILENO;    // read  ← client
-    int wr_fd = STDOUT_FILENO;   // write → client
+    int rd_fd = STDIN_FILENO;
+    int wr_fd = STDOUT_FILENO;
 
-    // Redirect our own stderr to a log (so stray writes don't break the pipe).
-    // srun keeps a separate channel for stderr, so this is optional.
-
-    // ---- auth ----
     RecvBuffer rbuf;
     if (!do_auth(wr_fd, rd_fd, rbuf))
         return 1;
 
-    // ---- receive SHELL_REQ ----
-    Message msg;
-    while (true) {
-        ssize_t n = rbuf.feed(rd_fd);
-        if (n <= 0) return 1;
-        if (rbuf.parse(msg)) break;
-    }
-    if (msg.type != MSG_SHELL_REQ) return 1;
-
-    Unpacker u(msg.payload);
-    uint16_t    rows    = u.u16();
-    uint16_t    cols    = u.u16();
-    std::string command = u.str();
-    if (!u.ok()) return 1;
-
-    // ---- allocate PTY + fork ----
-    struct winsize ws{};
-    ws.ws_row = rows;
-    ws.ws_col = cols;
-
-    int   master_fd = -1;
-    pid_t child     = forkpty(&master_fd, nullptr, nullptr, &ws);
-    if (child < 0) { perror("srunshd: forkpty"); return 1; }
-
-    if (child == 0) {
-        // ---- child: exec shell / command ----
-        setenv("TERM", "xterm-256color", 1);
-        if (command.empty()) {
-            const char* sh = getenv("SHELL");
-            if (!sh) sh = "/bin/bash";
-            execlp(sh, sh, "-l", nullptr);
-        } else {
-            execlp("/bin/sh", "sh", "-c", command.c_str(), nullptr);
-        }
-        perror("srunshd: exec");
-        _exit(127);
-    }
-
-    // ---- parent: multiplex ----
     set_nonblock(rd_fd);
-    set_nonblock(master_fd);
 
-    std::map<uint32_t, int> chan_fd;
-    std::map<int, uint32_t> fd_chan;
-    bool running = true;
+    std::map<uint32_t, ShellSession> shells;
+    std::map<int, uint32_t> mfd_chan;      // master_fd → channel
+    std::map<uint32_t, int> fwd_fd;        // fwd channel → socket
+    std::map<int, uint32_t> fd_fwd;        // fwd socket → channel
+    bool running   = true;
+    bool pipe_open = true;
 
     while (running && !g_term) {
-        // Has the child exited?
+        // ---- reap exited children ----
         int wst;
-        pid_t w = waitpid(child, &wst, WNOHANG);
-        if (w > 0) {
-            // Drain remaining PTY output.
-            uint8_t buf[4096];
-            for (;;) {
-                ssize_t n = read(master_fd, buf, sizeof(buf));
-                if (n <= 0) break;
-                send_msg(wr_fd,
-                         make_msg(MSG_SHELL_DATA, 0, buf,
-                                  static_cast<size_t>(n)));
+        pid_t w;
+        while ((w = waitpid(-1, &wst, WNOHANG)) > 0) {
+            for (auto it = shells.begin(); it != shells.end(); ++it) {
+                if (it->second.child != w) continue;
+                uint32_t ch = it->first;
+                int mfd     = it->second.master_fd;
+
+                // drain remaining PTY output
+                uint8_t buf[4096];
+                for (;;) {
+                    ssize_t n = read(mfd, buf, sizeof(buf));
+                    if (n <= 0) break;
+                    send_msg(wr_fd, make_msg(MSG_SHELL_DATA, ch, buf,
+                                             static_cast<size_t>(n)));
+                }
+                int code = WIFEXITED(wst) ? WEXITSTATUS(wst)
+                                          : 128 + WTERMSIG(wst);
+                Packer p; p.u32(static_cast<uint32_t>(code));
+                send_msg(wr_fd, make_msg(MSG_SHELL_EXIT, ch, p.finish()));
+
+                close(mfd);
+                mfd_chan.erase(mfd);
+                shells.erase(it);
+                break;
             }
-            int code = WIFEXITED(wst) ? WEXITSTATUS(wst)
-                                      : 128 + WTERMSIG(wst);
-            Packer p;
-            p.u32(static_cast<uint32_t>(code));
-            send_msg(wr_fd, make_msg(MSG_SHELL_EXIT, 0, p.finish()));
-            running = false;
-            break;
         }
 
-        // Build poll set
+        // exit when pipe closed and nothing left to serve
+        if (!pipe_open && shells.empty() && fwd_fd.empty())
+            break;
+
+        // ---- process buffered messages ----
+        {
+            Message m;
+            while (rbuf.parse(m)) {
+                switch (m.type) {
+                case MSG_SHELL_REQ: {
+                    Unpacker u(m.payload);
+                    uint16_t rows = u.u16(), cols = u.u16();
+                    std::string cmd = u.str();
+                    if (u.ok())
+                        create_shell(m.channel, rows, cols, cmd,
+                                     shells, mfd_chan);
+                    break;
+                }
+                case MSG_SHELL_DATA:
+                    if (shells.count(m.channel))
+                        (void)!write(shells[m.channel].master_fd,
+                                     m.payload.data(), m.payload.size());
+                    break;
+                case MSG_SHELL_RESIZE:
+                    if (shells.count(m.channel)) {
+                        Unpacker ru(m.payload);
+                        struct winsize nws{};
+                        nws.ws_row = ru.u16();
+                        nws.ws_col = ru.u16();
+                        ioctl(shells[m.channel].master_fd, TIOCSWINSZ, &nws);
+                    }
+                    break;
+                case MSG_SHELL_CLOSE:
+                    kill_shell(m.channel, shells, mfd_chan);
+                    break;
+
+                case MSG_FWD_OPEN: {
+                    Unpacker fu(m.payload);
+                    std::string host = fu.str();
+                    uint16_t port    = fu.u16();
+                    int conn = connect_to(host, port);
+                    if (conn >= 0) {
+                        set_nonblock(conn);
+                        fwd_fd[m.channel] = conn;
+                        fd_fwd[conn]      = m.channel;
+                        send_msg(wr_fd, make_msg(MSG_FWD_ACCEPT, m.channel));
+                    } else {
+                        send_msg(wr_fd, make_msg(MSG_FWD_REJECT, m.channel));
+                    }
+                    break;
+                }
+                case MSG_FWD_DATA:
+                    if (fwd_fd.count(m.channel))
+                        (void)!write(fwd_fd[m.channel],
+                                     m.payload.data(), m.payload.size());
+                    break;
+                case MSG_FWD_CLOSE:
+                    if (fwd_fd.count(m.channel)) {
+                        int cfd = fwd_fd[m.channel];
+                        close(cfd);
+                        fd_fwd.erase(cfd);
+                        fwd_fd.erase(m.channel);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // ---- build poll set ----
         std::vector<struct pollfd> pfds;
-        pfds.push_back({rd_fd,     POLLIN, 0});
-        pfds.push_back({master_fd, POLLIN, 0});
-        for (auto& [fd, _] : fd_chan)
+        if (pipe_open)
+            pfds.push_back({rd_fd, POLLIN, 0});
+        for (auto& [mfd, _] : mfd_chan)
+            pfds.push_back({mfd, POLLIN, 0});
+        for (auto& [fd, _] : fd_fwd)
             pfds.push_back({fd, POLLIN, 0});
+
+        if (pfds.empty()) break;
 
         if (poll(pfds.data(), pfds.size(), 200) < 0) {
             if (errno == EINTR) continue;
@@ -195,101 +276,50 @@ int main() {
             if (!(pfd.revents & (POLLIN | POLLHUP | POLLERR)))
                 continue;
 
-            // ---- messages from client ----
+            // ---- client pipe ----
             if (pfd.fd == rd_fd) {
                 ssize_t n = rbuf.feed(rd_fd);
-                if (n == 0)                   { running = false; break; }
-                if (n < 0 && errno != EAGAIN) { running = false; break; }
-
-                Message m;
-                while (rbuf.parse(m)) {
-                    switch (m.type) {
-                    case MSG_SHELL_DATA:
-                        (void)!write(master_fd,
-                                     m.payload.data(), m.payload.size());
-                        break;
-
-                    case MSG_SHELL_RESIZE: {
-                        Unpacker ru(m.payload);
-                        struct winsize nws{};
-                        nws.ws_row = ru.u16();
-                        nws.ws_col = ru.u16();
-                        ioctl(master_fd, TIOCSWINSZ, &nws);
-                        break;
-                    }
-
-                    case MSG_FWD_OPEN: {
-                        Unpacker fu(m.payload);
-                        std::string host = fu.str();
-                        uint16_t    port = fu.u16();
-                        int conn = connect_to(host, port);
-                        if (conn >= 0) {
-                            set_nonblock(conn);
-                            chan_fd[m.channel] = conn;
-                            fd_chan[conn]      = m.channel;
-                            send_msg(wr_fd,
-                                     make_msg(MSG_FWD_ACCEPT, m.channel));
-                        } else {
-                            send_msg(wr_fd,
-                                     make_msg(MSG_FWD_REJECT, m.channel));
-                        }
-                        break;
-                    }
-
-                    case MSG_FWD_DATA:
-                        if (chan_fd.count(m.channel))
-                            (void)!write(chan_fd[m.channel],
-                                         m.payload.data(), m.payload.size());
-                        break;
-
-                    case MSG_FWD_CLOSE:
-                        if (chan_fd.count(m.channel)) {
-                            int cfd = chan_fd[m.channel];
-                            close(cfd);
-                            fd_chan.erase(cfd);
-                            chan_fd.erase(m.channel);
-                        }
-                        break;
-                    }
-                }
+                if (n == 0)                   { pipe_open = false; }
+                if (n < 0 && errno != EAGAIN) { pipe_open = false; }
+                // messages processed next iteration
             }
 
             // ---- PTY output ----
-            else if (pfd.fd == master_fd) {
+            else if (mfd_chan.count(pfd.fd)) {
                 if (pfd.revents & POLLIN) {
+                    uint32_t ch = mfd_chan[pfd.fd];
                     uint8_t buf[4096];
-                    ssize_t n = read(master_fd, buf, sizeof(buf));
+                    ssize_t n = read(pfd.fd, buf, sizeof(buf));
                     if (n > 0)
-                        send_msg(wr_fd,
-                                 make_msg(MSG_SHELL_DATA, 0, buf,
-                                          static_cast<size_t>(n)));
+                        send_msg(wr_fd, make_msg(MSG_SHELL_DATA, ch, buf,
+                                                 static_cast<size_t>(n)));
                 }
-                // POLLHUP on master → child likely exited, next waitpid picks it up.
             }
 
-            // ---- forwarded socket data ----
-            else if (fd_chan.count(pfd.fd)) {
-                uint32_t ch = fd_chan[pfd.fd];
+            // ---- forwarded socket ----
+            else if (fd_fwd.count(pfd.fd)) {
+                uint32_t ch = fd_fwd[pfd.fd];
                 uint8_t buf[8192];
                 ssize_t n = read(pfd.fd, buf, sizeof(buf));
                 if (n > 0) {
-                    send_msg(wr_fd,
-                             make_msg(MSG_FWD_DATA, ch, buf,
-                                      static_cast<size_t>(n)));
+                    send_msg(wr_fd, make_msg(MSG_FWD_DATA, ch, buf,
+                                             static_cast<size_t>(n)));
                 } else {
                     send_msg(wr_fd, make_msg(MSG_FWD_CLOSE, ch));
                     close(pfd.fd);
-                    fd_chan.erase(pfd.fd);
-                    chan_fd.erase(ch);
+                    fd_fwd.erase(pfd.fd);
+                    fwd_fd.erase(ch);
                 }
             }
         }
     }
 
     // ---- cleanup ----
-    close(master_fd);
-    for (auto& [_, fd] : chan_fd) close(fd);
-    kill(child, SIGHUP);
-    waitpid(child, nullptr, 0);
+    for (auto& [_, s] : shells) {
+        close(s.master_fd);
+        kill(s.child, SIGHUP);
+    }
+    for (auto& [_, fd] : fwd_fd) close(fd);
+    while (waitpid(-1, nullptr, 0) > 0) {}
     return 0;
 }

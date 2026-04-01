@@ -91,8 +91,14 @@ struct ShellSession {
     pid_t child;
 };
 
+struct ShellEnv {
+    std::string term;
+    std::string colorterm;
+    std::string lang;
+};
+
 static bool create_shell(uint32_t channel, uint16_t rows, uint16_t cols,
-                         const std::string& command,
+                         const std::string& command, const ShellEnv& env,
                          std::map<uint32_t, ShellSession>& shells,
                          std::map<int, uint32_t>& mfd_chan) {
     struct winsize ws{};
@@ -104,7 +110,11 @@ static bool create_shell(uint32_t channel, uint16_t rows, uint16_t cols,
     if (child < 0) return false;
 
     if (child == 0) {
-        setenv("TERM", "xterm-256color", 1);
+        // Forward client terminal environment
+        setenv("TERM", (env.term.empty() ? "xterm-256color" : env.term.c_str()), 1);
+        if (!env.colorterm.empty()) setenv("COLORTERM", env.colorterm.c_str(), 1);
+        if (!env.lang.empty())      setenv("LANG",      env.lang.c_str(), 1);
+
         const char* sh = getenv("SHELL");
         if (!sh) sh = "/bin/bash";
         if (command.empty())
@@ -200,8 +210,12 @@ int main() {
                     Unpacker u(m.payload);
                     uint16_t rows = u.u16(), cols = u.u16();
                     std::string cmd = u.str();
+                    ShellEnv env;
+                    if (u.remaining() > 0) env.term      = u.str();
+                    if (u.remaining() > 0) env.colorterm  = u.str();
+                    if (u.remaining() > 0) env.lang       = u.str();
                     if (u.ok())
-                        create_shell(m.channel, rows, cols, cmd,
+                        create_shell(m.channel, rows, cols, cmd, env,
                                      shells, mfd_chan);
                     break;
                 }

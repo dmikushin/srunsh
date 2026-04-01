@@ -228,21 +228,37 @@ static bool do_auth(int wr, int rd, RecvBuffer& rbuf) {
 }
 
 // ================================================================
+//  Build SHELL_REQ payload: rows, cols, command, TERM, COLORTERM, LANG
+// ================================================================
+static std::vector<uint8_t> make_shell_req_payload(const std::string& cmd) {
+    struct winsize ws{24, 80, 0, 0};
+    if (isatty(STDIN_FILENO))
+        ioctl(STDIN_FILENO, TIOCGWINSZ, &ws);
+
+    auto env = [](const char* name) -> std::string {
+        const char* v = getenv(name);
+        return v ? v : "";
+    };
+
+    Packer p;
+    p.u16(ws.ws_row);
+    p.u16(ws.ws_col);
+    p.str(cmd);
+    p.str(env("TERM"));
+    p.str(env("COLORTERM"));
+    p.str(env("LANG"));
+    return p.finish();
+}
+
+// ================================================================
 //  Slave mode — connect to existing ControlMaster
 // ================================================================
 static int run_as_slave(int master_fd,
                         const std::string& remote_cmd) {
-    // Send SHELL_REQ to master
-    {
-        struct winsize ws{24, 80, 0, 0};
-        if (isatty(STDIN_FILENO))
-            ioctl(STDIN_FILENO, TIOCGWINSZ, &ws);
-        Packer p;
-        p.u16(ws.ws_row); p.u16(ws.ws_col); p.str(remote_cmd);
-        if (!send_msg(master_fd, make_msg(MSG_SHELL_REQ, 0, p.finish()))) {
-            fprintf(stderr, "srunsh: master not responding\n");
-            return 1;
-        }
+    if (!send_msg(master_fd,
+                  make_msg(MSG_SHELL_REQ, 0, make_shell_req_payload(remote_cmd)))) {
+        fprintf(stderr, "srunsh: master not responding\n");
+        return 1;
     }
 
     set_raw_mode();
@@ -360,14 +376,7 @@ static int run_as_master(const std::string& job_id,
     }
 
     // ---- send SHELL_REQ for our own session (channel 0) ----
-    {
-        struct winsize ws{24, 80, 0, 0};
-        if (isatty(STDIN_FILENO))
-            ioctl(STDIN_FILENO, TIOCGWINSZ, &ws);
-        Packer p;
-        p.u16(ws.ws_row); p.u16(ws.ws_col); p.str(remote_cmd);
-        send_msg(wr_fd, make_msg(MSG_SHELL_REQ, 0, p.finish()));
-    }
+    send_msg(wr_fd, make_msg(MSG_SHELL_REQ, 0, make_shell_req_payload(remote_cmd)));
 
     // ---- port-forward listeners ----
     std::map<int, size_t> listener_idx;

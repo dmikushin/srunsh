@@ -105,13 +105,12 @@ static bool create_shell(uint32_t channel, uint16_t rows, uint16_t cols,
 
     if (child == 0) {
         setenv("TERM", "xterm-256color", 1);
-        if (command.empty()) {
-            const char* sh = getenv("SHELL");
-            if (!sh) sh = "/bin/bash";
+        const char* sh = getenv("SHELL");
+        if (!sh) sh = "/bin/bash";
+        if (command.empty())
             execlp(sh, sh, "-l", nullptr);
-        } else {
-            execlp("/bin/sh", "sh", "-c", command.c_str(), nullptr);
-        }
+        else
+            execlp(sh, sh, "-l", "-c", command.c_str(), nullptr);
         _exit(127);
     }
 

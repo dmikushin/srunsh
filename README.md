@@ -2,6 +2,8 @@
 
 SSH-like shell over SLURM srun for SLURM nodes that have restricted or broken login shell.
 
+![srunsh diagram](./diagram.png)
+
 When the SLURM job is allocated, it is usually allowed to login to the corresponding compute nodes via SSH, e.g. `ssh compute01`.
 Obviously, such feature is highly desirable to unify local and cluster experiences, run interactive scripts, etc.
 

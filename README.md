@@ -11,6 +11,8 @@ interactive shell sessions via srun. Basically, srun is used as a "transport lay
 
 ## Examples
 
+The main idea is to put the SLURM job id following the `-S` option, instead of using ssh node hostname or address:
+
 ```
 srunsh -L 11434:localhost:11434 -S 70029 -- --gres=gpu:4 -- ollama serve
 

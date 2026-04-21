@@ -11,11 +11,26 @@ services:
     networks:
       cluster:
 
-  compute:
+  compute1:
     build:
       context: ..
       dockerfile: test/Dockerfile
-    hostname: compute
+    hostname: compute1
+    command: ["/bin/bash", "/test/entry-compute.sh"]
+    volumes:
+      - ./:/test:ro
+      - ./slurm.conf:/etc/slurm/slurm.conf:ro
+      - srunsh-home:/root/.srunsh
+    depends_on:
+      - controller
+    networks:
+      cluster:
+
+  compute2:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    hostname: compute2
     command: ["/bin/bash", "/test/entry-compute.sh"]
     volumes:
       - ./:/test:ro
@@ -38,7 +53,8 @@ services:
       - srunsh-home:/root/.srunsh
     depends_on:
       - controller
-      - compute
+      - compute1
+      - compute2
     networks:
       cluster:
 

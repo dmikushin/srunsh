@@ -16,16 +16,17 @@ sleep 0.5
 # Generate srunsh keypair (writes to shared volume /root/.srunsh)
 srunsh-keygen
 
-# Wait for SLURM to be fully operational
+# Wait for SLURM to be fully operational (both nodes idle)
 echo "Waiting for SLURM cluster..."
 for i in $(seq 1 60); do
-    if sinfo 2>/dev/null | grep -qw idle; then
+    IDLE_COUNT=$(sinfo -h -t idle -o "%D" 2>/dev/null | awk '{s+=$1}END{print s+0}')
+    if [ "$IDLE_COUNT" -ge 2 ]; then
         break
     fi
     sleep 1
 done
-if ! sinfo 2>/dev/null | grep -qw idle; then
-    echo "FAIL: SLURM cluster not ready"
+if [ "$(sinfo -h -t idle -o '%D' 2>/dev/null | awk '{s+=$1}END{print s+0}')" -lt 2 ]; then
+    echo "FAIL: SLURM cluster not ready (need 2 idle nodes)"
     sinfo 2>&1 || true
     exit 1
 fi
@@ -96,6 +97,42 @@ if [ "$REPLY" = "ping_fwd" ]; then
 else
     echo "FAIL: got '$REPLY'"
     FAIL=$((FAIL+1))
+fi
+
+echo "=== Test 4: multi-node (per-node ControlMaster) ==="
+# Allocate a 2-node job in the background (salloc --no-shell holds the allocation)
+salloc -N2 --no-shell -J srunsh-test &>/dev/null &
+SALLOC_PID=$!
+sleep 2
+
+JOBID=$(squeue -h -n srunsh-test -o "%i" | head -1)
+if [ -z "$JOBID" ]; then
+    echo "FAIL: could not allocate 2-node job"
+    kill $SALLOC_PID 2>/dev/null
+    FAIL=$((FAIL+1))
+else
+    echo "  Allocated job $JOBID"
+
+    # Run command on compute1
+    OUT1=$(echo "" | timeout 30 srunsh -S "$JOBID" -n compute1 -- -- "hostname; exit 0" 2>/dev/null)
+    # Run command on compute2
+    OUT2=$(echo "" | timeout 30 srunsh -S "$JOBID" -n compute2 -- -- "hostname; exit 0" 2>/dev/null)
+
+    # Verify each ran on the correct node
+    GOT1=$(echo "$OUT1" | grep -o "compute1" | head -1)
+    GOT2=$(echo "$OUT2" | grep -o "compute2" | head -1)
+
+    if [ "$GOT1" = "compute1" ] && [ "$GOT2" = "compute2" ]; then
+        echo "PASS"
+        PASS=$((PASS+1))
+    else
+        echo "FAIL: expected compute1/compute2, got '$OUT1' / '$OUT2'"
+        FAIL=$((FAIL+1))
+    fi
+
+    scancel "$JOBID" 2>/dev/null
+    kill $SALLOC_PID 2>/dev/null
+    wait $SALLOC_PID 2>/dev/null
 fi
 
 echo ""

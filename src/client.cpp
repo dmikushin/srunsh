@@ -181,14 +181,17 @@ static void usage() {
         "Options:\n"
         "  -L lport:host:rport   Local port forwarding (repeatable)\n"
         "  -S jobid              Attach to existing SLURM job\n"
+        "  -n node               Target specific node (default: first in job)\n"
         "  -h, --help            Show this help\n"
         "\n"
         "First invocation with -S becomes the ControlMaster (launches srun).\n"
         "Subsequent invocations reuse the same connection automatically.\n"
+        "Each node gets its own ControlMaster (socket: $JOBID-$NODE.sock).\n"
         "\n"
         "Example:\n"
-        "  srunsh -L 11434:localhost:11434 -S 70029 -- --gres=gpu:4 -- ollama serve\n"
-        "  srunsh -S 70029                     # new shell, same GPUs\n"
+        "  srunsh -S 70029 -n compute01 -- --gres=gpu:4 -- ollama serve\n"
+        "  srunsh -S 70029 -n compute01            # new shell, same node\n"
+        "  srunsh -S 70029                          # auto-selects first node\n"
     );
 }
 
@@ -330,6 +333,7 @@ static int run_as_slave(int master_fd,
 //  Master mode — launch srun, manage multiplexed sessions
 // ================================================================
 static int run_as_master(const std::string& job_id,
+                         const std::string& node,
                          const std::vector<std::string>& srun_opts,
                          const std::string& remote_cmd,
                          const std::vector<PortForward>& forwards) {
@@ -341,6 +345,11 @@ static int run_as_master(const std::string& job_id,
     cmd.emplace_back("--unbuffered");
     if (!job_id.empty())
         cmd.push_back("--jobid=" + job_id);
+    if (!node.empty()) {
+        cmd.push_back("--nodelist=" + node);
+        cmd.push_back("--nodes=1");
+        cmd.push_back("--ntasks=1");
+    }
     for (auto& o : srun_opts) cmd.push_back(o);
     cmd.push_back(server_bin);
 
@@ -399,7 +408,7 @@ static int run_as_master(const std::string& job_id,
     if (!job_id.empty()) {
         std::string ctl_dir = srunsh_dir() + "/ctl";
         fs::create_directories(ctl_dir);
-        g_ctl_path = ctl_dir + "/" + job_id + ".sock";
+        g_ctl_path = ctl_dir + "/" + job_id + "-" + node + ".sock";
         ctl_fd = create_unix_listener(g_ctl_path);
         if (ctl_fd >= 0)
             atexit(cleanup_ctl);
@@ -635,6 +644,7 @@ static int run_as_master(const std::string& job_id,
 int main(int argc, char* argv[]) {
     std::vector<PortForward> forwards;
     std::string              job_id;
+    std::string              node;
 
     // 1. Parse srunsh options
     int i = 1;
@@ -651,6 +661,8 @@ int main(int argc, char* argv[]) {
             forwards.push_back(fwd);
         } else if (a == "-S" && i + 1 < argc) {
             job_id = argv[++i];
+        } else if (a == "-n" && i + 1 < argc) {
+            node = argv[++i];
         } else {
             fprintf(stderr, "srunsh: unknown option: %s\n", a.c_str());
             usage(); return 1;
@@ -674,11 +686,63 @@ int main(int argc, char* argv[]) {
         remote_cmd += argv[i];
     }
 
+    // ---- resolve target node ----
+    if (!job_id.empty() && node.empty()) {
+        std::string cmd = "scontrol show job " + job_id + " --oneliner 2>/dev/null";
+        FILE* fp = popen(cmd.c_str(), "r");
+        if (fp) {
+            char line[8192];
+            while (fgets(line, sizeof(line), fp)) {
+                const char* p = strstr(line, " NodeList=");
+                if (!p) p = strstr(line, "\tNodeList=");
+                if (!p && strncmp(line, "NodeList=", 9) == 0) p = line - 1;
+                if (p) {
+                    p = strchr(p, '=') + 1;
+                    std::string nl;
+                    while (*p && *p != ' ' && *p != '\n') nl += *p++;
+                    std::string expand = "scontrol show hostnames " + nl + " 2>/dev/null";
+                    FILE* fp2 = popen(expand.c_str(), "r");
+                    if (fp2) {
+                        std::vector<std::string> nodes;
+                        char hbuf[256];
+                        while (fgets(hbuf, sizeof(hbuf), fp2)) {
+                            std::string h(hbuf);
+                            while (!h.empty() && (h.back()=='\n'||h.back()=='\r'))
+                                h.pop_back();
+                            if (!h.empty()) nodes.push_back(h);
+                        }
+                        pclose(fp2);
+                        if (!nodes.empty()) {
+                            node = nodes[0];
+                            if (nodes.size() > 1) {
+                                fprintf(stderr, "srunsh: job %s has %zu nodes, "
+                                        "defaulting to %s\n",
+                                        job_id.c_str(), nodes.size(), node.c_str());
+                                fprintf(stderr, "srunsh: use -n to select: ");
+                                for (size_t j = 0; j < nodes.size(); ++j)
+                                    fprintf(stderr, "%s%s", j ? ", " : "",
+                                            nodes[j].c_str());
+                                fprintf(stderr, "\n");
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            pclose(fp);
+        }
+        if (node.empty()) {
+            fprintf(stderr, "srunsh: could not determine node for job %s "
+                    "(use -n to specify)\n", job_id.c_str());
+            return 1;
+        }
+    }
+
     // ---- decide: slave or master ----
     if (!job_id.empty()) {
         std::string ctl_dir  = srunsh_dir() + "/ctl";
         fs::create_directories(ctl_dir);
-        std::string ctl_path = ctl_dir + "/" + job_id + ".sock";
+        std::string ctl_path = ctl_dir + "/" + job_id + "-" + node + ".sock";
 
         int master_fd = connect_unix(ctl_path);
         if (master_fd >= 0) {
@@ -696,5 +760,5 @@ int main(int argc, char* argv[]) {
         // No master yet — fall through to become master
     }
 
-    return run_as_master(job_id, srun_opts, remote_cmd, forwards);
+    return run_as_master(job_id, node, srun_opts, remote_cmd, forwards);
 }

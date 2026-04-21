@@ -16,13 +16,16 @@ interactive shell sessions via srun. Basically, srun is used as a "transport lay
 The main idea is to put the SLURM job id following the `-S` option, instead of using ssh node hostname or address:
 
 ```
-srunsh -L 11434:localhost:11434 -S 70029 -- --gres=gpu:4 -- ollama serve
+srunsh -L 11434:localhost:11434 -S 70029 -n compute01 -- --gres=gpu:4 -- ollama serve
 
-# new shell, same GPUs
+# new shell, same node and GPUs
+srunsh -S 70029 -n compute01
+
+# auto-select first node in the allocation
 srunsh -S 70029
 
 # choose shell program manually
-srunsh -S 71938 -- --gres=gpu:4 -- fish
+srunsh -S 71938 -n compute02 -- --gres=gpu:4 -- fish
 ```
 
 
@@ -34,10 +37,12 @@ srunsh [options] [-- [srun_opts...] [-- command...]]
 Options:
   -L lport:host:rport   Local port forwarding (repeatable)
   -S jobid              Attach to existing SLURM job
+  -n node               Target specific node (default: first in job)
   -h, --help            Show this help
 
 First invocation with -S becomes the ControlMaster (launches srun).
 Subsequent invocations reuse the same connection automatically.
+Each node gets its own ControlMaster (socket: $JOBID-$NODE.sock).
 ```
 
 

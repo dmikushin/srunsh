@@ -24,3 +24,20 @@ add_executable(srunsh-keygen src/keygen.cpp)
 target_link_libraries(srunsh-keygen PRIVATE srunsh_common)
 
 install(TARGETS srunsh srunshd srunsh-keygen DESTINATION bin)
+
+# --- Tests ---
+enable_testing()
+
+add_test(NAME test_local
+    COMMAND bash ${CMAKE_SOURCE_DIR}/test_local.sh
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_test(NAME test_cluster
+    COMMAND docker compose -f ${CMAKE_SOURCE_DIR}/test/docker-compose.yml
+            up --build --abort-on-container-exit --exit-code-from login
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/test)
+
+set_tests_properties(test_cluster PROPERTIES
+    TIMEOUT 300
+    LABELS "integration;docker")
+

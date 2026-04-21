@@ -1,0 +1,50 @@
+services:
+  controller:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    hostname: controller
+    command: ["/bin/bash", "/test/entry-controller.sh"]
+    volumes:
+      - ./:/test:ro
+      - ./slurm.conf:/etc/slurm/slurm.conf:ro
+    networks:
+      cluster:
+
+  compute:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    hostname: compute
+    command: ["/bin/bash", "/test/entry-compute.sh"]
+    volumes:
+      - ./:/test:ro
+      - ./slurm.conf:/etc/slurm/slurm.conf:ro
+      - srunsh-home:/root/.srunsh
+    depends_on:
+      - controller
+    networks:
+      cluster:
+
+  login:
+    build:
+      context: ..
+      dockerfile: test/Dockerfile
+    hostname: login
+    command: ["/bin/bash", "/test/run-tests.sh"]
+    volumes:
+      - ./:/test:ro
+      - ./slurm.conf:/etc/slurm/slurm.conf:ro
+      - srunsh-home:/root/.srunsh
+    depends_on:
+      - controller
+      - compute
+    networks:
+      cluster:
+
+volumes:
+  srunsh-home:
+
+networks:
+  cluster:
+    driver: bridge

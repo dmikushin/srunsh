@@ -39,3 +39,27 @@ Options:
 First invocation with -S becomes the ControlMaster (launches srun).
 Subsequent invocations reuse the same connection automatically.
 ```
+
+
+## Building and testing
+
+```bash
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+```
+
+Run the local integration test (no SLURM required):
+
+```bash
+ctest -R test_local
+```
+
+Run the full cluster test (requires Docker):
+
+```bash
+ctest -R test_cluster
+```
+
+This spins up a 3-node SLURM cluster (controller, compute, login) in Docker
+and verifies remote command execution, exit code propagation, and port forwarding.
